@@ -1,0 +1,165 @@
+#!/bin/bash
+set -euo pipefail
+
+
+LOG_FILE="/var/log/user-audit.log"
+FINDINGS=0
+TMP_DIR=""
+
+
+log_msg() {
+    local level="$1"
+    local msg="$2"
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    echo "[${timestamp}] [${level}] ${msg}" | tee -a "${LOG_FILE}"
+}
+
+
+show_help() {
+    echo "Uso: sudo $0 [OPCOES]"
+    echo ""
+    echo "Opcoes:"
+    echo "  -h, --help    Exibe esta mensagem de ajuda"
+    echo ""
+    echo "Codigos de saida:"
+    echo "  0: Sucesso (sem achados)"
+    echo "  1: Achado de seguranca encontrado"
+    echo "  2: Erro de uso ou de sintaxe"
+    echo "  3: Dependencia obrigatoria ausente"
+}
+
+
+check_prerequisites() {
+    if [ "${EUID}" -ne 0 ]; then
+        echo "ERRO: Este script deve ser executado como root." >&2
+        exit 2
+    fi
+
+    local deps=("grep" "cut" "awk" "lastlog" "chage")
+    local cmd
+    for cmd in "${deps[@]}"; do
+        if ! command -v "${cmd}" >/dev/null 2>&1; then
+            echo "ERRO: Dependencia ausente: ${cmd}" >&2
+            exit 3
+        fi
+    done
+
+    TMP_DIR="$(mktemp -d /tmp/user-audit.XXXXXX)"
+    trap 'rm -rf "${TMP_DIR}"' EXIT INT TERM
+
+    touch "${LOG_FILE}" 2>/dev/null || {
+        echo "ERRO: Nao foi possivel escrever em ${LOG_FILE}" >&2
+        exit 2
+    }
+
+    log_msg "INFO" "Iniciando auditoria de contas e privilegios."
+}
+
+
+audit_accounts() {
+    log_msg "INFO" "Verificando contas com UID 0..."
+    local uid_zero_count
+    uid_zero_count="$(grep -c -E '^[^:]+:[^:]+:0:' /etc/passwd || true)"
+    if [ "${uid_zero_count}" -gt 1 ]; then
+        log_msg "WARN" "ACHADO: Mais de uma conta possui UID 0."
+        FINDINGS=$((FINDINGS + 1))
+    else
+        log_msg "INFO" "OK: Apenas a conta root possui UID 0."
+    fi
+
+    log_msg "INFO" "Verificando senhas vazias no /etc/shadow..."
+    local empty_pass
+    empty_pass="$(cut -d: -f1,2 /etc/shadow | grep '::$' || true)"
+    if [ -n "${empty_pass}" ]; then
+        log_msg "WARN" "ACHADO: Conta com campo de senha vazio encontrada."
+        FINDINGS=$((FINDINGS + 1))
+    else
+        log_msg "INFO" "OK: Nenhuma conta com senha vazia."
+    fi
+
+    log_msg "INFO" "Verificando contas de sistema com shell interativo..."
+    local bad_shells
+    bad_shells="$(awk -F: '($3 > 0 && $3 < 1000) && ($7 !~ /(nologin|false)$/) { print $1 }' /etc/passwd || true)"
+    if [ -n "${bad_shells}" ]; then
+        log_msg "WARN" "ACHADO: Contas de sistema com shell interativo: ${bad_shells}"
+        FINDINGS=$((FINDINGS + 1))
+    else
+        log_msg "INFO" "OK: Contas de sistema estao com shell restrito."
+    fi
+}
+
+
+audit_security_configs() {
+    log_msg "INFO" "Verificando expiracao de senha para usuarios normais..."
+    local user uid
+    while IFS=: read -r user _ uid _; do
+        if [ "${uid}" -ge 1000 ] && [ "${user}" != "nobody" ]; then
+            local max_days
+            max_days="$(chage -l "${user}" 2>/dev/null | grep "Maximum" | cut -d: -f2 | tr -d ' ' || echo "99999")"
+            if [ "${max_days}" = "99999" ] || [ "${max_days}" = "-1" ]; then
+                log_msg "WARN" "ACHADO: Usuario [${user}] sem expiracao de senha definida."
+                FINDINGS=$((FINDINGS + 1))
+            fi
+        fi
+    done < /etc/passwd
+
+    log_msg "INFO" "Verificando regras NOPASSWD no sudoers..."
+    local nopasswd_rules
+    nopasswd_rules="$(grep -r "NOPASSWD" /etc/sudoers /etc/sudoers.d/ 2>/dev/null | grep -v '^#' || true)"
+    if [ -n "${nopasswd_rules}" ]; then
+        log_msg "WARN" "ACHADO: Regras NOPASSWD encontradas no sudoers."
+        FINDINGS=$((FINDINGS + 1))
+    else
+        log_msg "INFO" "OK: Nenhuma regra NOPASSWD encontrada."
+    fi
+
+    log_msg "INFO" "Verificando pwquality minlen..."
+    local pwq_file="/etc/security/pwquality.conf"
+    if [ -f "${pwq_file}" ]; then
+        local minlen
+        minlen="$(grep "^minlen" "${pwq_file}" | cut -d'=' -f2 | tr -d ' ' || echo "0")"
+        if [ -z "${minlen}" ] || [ "${minlen}" -lt 12 ]; then
+            log_msg "WARN" "ACHADO: pwquality minlen e menor que 12 ou nao esta definido."
+            FINDINGS=$((FINDINGS + 1))
+        else
+            log_msg "INFO" "OK: pwquality minlen esta correto (${minlen})."
+        fi
+    else
+        log_msg "WARN" "ACHADO: Arquivo ${pwq_file} nao encontrado."
+        FINDINGS=$((FINDINGS + 1))
+    fi
+}
+
+main() {
+    local param="${1:-}"
+
+    case "${param}" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        "")
+            check_prerequisites
+            audit_accounts
+            audit_security_configs
+
+            log_msg "INFO" "Auditoria concluida. Total de achados: ${FINDINGS}"
+
+            if [ "${FINDINGS}" -gt 0 ]; then
+                echo "ATENCAO: Auditoria finalizada com ${FINDINGS} achado(s) de risco."
+                exit 1
+            fi
+
+            echo "Auditoria concluida com sucesso. Nenhum achado."
+            exit 0
+            ;;
+        *)
+            echo "Parametro invalido: ${param}" >&2
+            echo "Use -h ou --help para exibir a ajuda." >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
